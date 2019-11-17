@@ -3,7 +3,7 @@ package com.yuiwai.elevator
 import akka.actor.typed.scaladsl.Behaviors
 import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
 import com.yuiwai.elevator.Building._
-import com.yuiwai.elevator.Elevator.{Direction, ElevatorEvent, ElevatorInitialized, ElevatorMsg, ElevatorProps}
+import com.yuiwai.elevator.Elevator.{Direction, Down, ElevatorEvent, ElevatorInitialized, ElevatorMsg, ElevatorProps, Execute, StateKept}
 import com.yuiwai.elevator.ElevatorSystem.{BuildingCallback, PassengerGeneratorCallback}
 import com.yuiwai.elevator.Passenger.{PassengerEvent, PassengerMsg, PassengerProps}
 import com.yuiwai.elevator.PassengerGenerator.{apply => _, _}
@@ -34,53 +34,55 @@ object ElevatorSystem {
   def apply(setting: BuildingSetting, seed: Long = 1): Behavior[ElevatorSystemMsg] = Behaviors.setup { ctx =>
     Random.setSeed(seed)
     implicit val elevatorSystemProps: ElevatorSystemProps = ElevatorSystemProps(
-      ctx.spawn(Building(BuildingProps(setting, ctx.self)), "building"),
+      ctx.spawn(Building(BuildingProps(setting, ctx.self, DefaultLogic)), "building"),
       ctx.spawn(PassengerGenerator(PassengerGeneratorProps(Random.nextInt, setting, ctx.self)), "passenger-generator")
     )
     initializing(ElevatorSystemState(0, Set.empty))
   }
 
-  private def initializing(state: ElevatorSystemState)(implicit props: ElevatorSystemProps): Behavior[ElevatorSystemMsg] =
+  private def initializing(state: ElevatorSystemState)
+    (implicit props: ElevatorSystemProps): Behavior[ElevatorSystemMsg] =
     Behaviors.receiveMessage {
-      case BuildingCallback(BuildingInitialized) => processing(state)
+      case BuildingCallback(BuildingInitialized) => beforeTurn(state)
     }
 
-  private def processing(state: ElevatorSystemState)
-    (implicit props: ElevatorSystemProps): Behavior[ElevatorSystemMsg] = {
-    def beforeTurn(): Behavior[ElevatorSystemMsg] = Behaviors.setup { ctx =>
-      props.generator ! GeneratePassenger(state.currentTime)
-      Behaviors.receiveMessage {
-        case PassengerGeneratorCallback(event) =>
-          event match {
-            case PassengerGenerated(destination, interval) =>
-              // TODO 現状は1ターンに最大1人ずつ生成
-              val passenger = ctx.spawn(
-                Passenger(PassengerProps(destination, interval, state.currentTime), 1),
-                s"passenger-${state.currentTime}")
-              props.building ! Join(passenger, 1)
-              processTurn(state.copy(passengers = state.passengers + passenger))
-          }
-      }
+  private[elevator] def beforeTurn(state: ElevatorSystemState)
+    (implicit props: ElevatorSystemProps): Behavior[ElevatorSystemMsg] = Behaviors.setup { ctx =>
+    props.generator ! GeneratePassenger(state.currentTime)
+    Behaviors.receiveMessage {
+      case PassengerGeneratorCallback(event) =>
+        event match {
+          case PassengerGenerated(destination, interval) =>
+            // TODO 現状は1ターンに最大1人ずつ生成
+            val passenger = ctx.spawn(
+              Passenger(PassengerProps(destination, interval, state.currentTime), 1),
+              s"passenger-${state.currentTime}")
+            Direction(1, destination) foreach (direction => props.building ! Join(passenger, 1, direction))
+            processTurn(state.copy(passengers = state.passengers + passenger))
+        }
     }
-    def processTurn(state: ElevatorSystemState)
-      (implicit props: ElevatorSystemProps): Behavior[ElevatorSystemMsg] = Behaviors.setup { ctx =>
-      println(state)
-      Behaviors.receiveMessage {
-        case _ =>
-          Behaviors.same
-      }
-    }
-    def afterTurn(): Behavior[ElevatorSystemMsg] = ???
-
-    beforeTurn()
   }
+
+  private[elevator] def processTurn(state: ElevatorSystemState)
+    (implicit props: ElevatorSystemProps): Behavior[ElevatorSystemMsg] = Behaviors.setup { ctx =>
+    props.building ! Tick(state.currentTime)
+    Behaviors.receiveMessage {
+      case BuildingCallback(event) =>
+        event match {
+          case Updated => afterTurn(state)
+        }
+    }
+  }
+
+  private[elevator] def afterTurn(state: ElevatorSystemState): Behavior[ElevatorSystemMsg] = ???
 }
 
 object Building {
   final case class BuildingSetting(numOfFloors: Int, numOfElevators: Int)
   final case class BuildingProps(
     setting: BuildingSetting,
-    system: ActorRef[BuildingCallback]
+    system: ActorRef[BuildingCallback],
+    logic: ElevatorLogic
   )
   final case class BuildingState(elevators: Set[ActorRef[ElevatorMsg]])
 
@@ -88,10 +90,11 @@ object Building {
     def callback: BuildingCallback = BuildingCallback(this)
   }
   case object BuildingInitialized extends BuildingEvent
+  case object Updated extends BuildingEvent
 
   sealed trait BuildingMsg
   final case class Tick(time: Int) extends BuildingMsg
-  final case class Join(passenger: ActorRef[PassengerMsg], floor: Int) extends BuildingMsg
+  final case class Join(passenger: ActorRef[PassengerMsg], floor: Int, direction: Direction) extends BuildingMsg
 
   final case class ElevatorCallback(event: ElevatorEvent) extends BuildingMsg
   final case class PassengerCallback(event: PassengerEvent) extends BuildingMsg
@@ -111,12 +114,26 @@ object Building {
     } else Behaviors.receiveMessage {
       case ElevatorCallback(ElevatorInitialized(elevator)) =>
         initializing(state.copy(elevators = state.elevators + elevator))
-      case _ => Behaviors.same
     }
 
-  private[elevator] def progressing(state: BuildingState)
-    (implicit props: BuildingProps): Behavior[BuildingMsg] = Behaviors.receive {
-    case _ => Behaviors.same
+  private[elevator] def progressing(state: BuildingState, numOfExecutedElevators: Int = 0)
+    (implicit props: BuildingProps): Behavior[BuildingMsg] = Behaviors.receiveMessage {
+    case Join(passenger, floor, direction) =>
+      props.logic.join(state, floor, direction)
+      Behaviors.same
+    case Tick(time) =>
+      state.elevators.foreach(_ ! Execute)
+      Behaviors.same
+
+    case ElevatorCallback(event) => event match {
+      case StateKept(stateType) =>
+        val count = numOfExecutedElevators + 1
+        if (count >= state.elevators.size) {
+          props.system ! Updated.callback
+          Behaviors.same
+        }
+        else progressing(state, count)
+    }
   }
 }
 
@@ -129,6 +146,12 @@ object Elevator {
   case object Moving extends ElevatorStateType
 
   sealed trait Direction
+  object Direction {
+    def apply(from: Int, to: Int): Option[Direction] =
+      if (from == to) None
+      else if (from > to) Some(Down)
+      else Some(Up)
+  }
   case object Up extends Direction
   case object Down extends Direction
 
@@ -239,5 +262,8 @@ object RandomUtil {
 }
 
 trait ElevatorLogic {
-
+  def join(state: BuildingState, floor: Int, direction: Direction): BuildingState
+}
+object DefaultLogic extends ElevatorLogic {
+  def join(state: BuildingState, floor: Int, direction: Direction): BuildingState = state
 }
