@@ -46,8 +46,8 @@ object ElevatorSystem {
     }
 
   private def processing(state: ElevatorSystemState)
-    (implicit props: ElevatorSystemProps): Behavior[ElevatorSystemMsg] =
-    Behaviors.setup { ctx =>
+    (implicit props: ElevatorSystemProps): Behavior[ElevatorSystemMsg] = {
+    def beforeTurn(): Behavior[ElevatorSystemMsg] = Behaviors.setup { ctx =>
       props.generator ! GeneratePassenger(state.currentTime)
       Behaviors.receiveMessage {
         case PassengerGeneratorCallback(event) =>
@@ -58,11 +58,22 @@ object ElevatorSystem {
                 Passenger(PassengerProps(destination, interval, state.currentTime), 1),
                 s"passenger-${state.currentTime}")
               props.building ! Join(passenger, 1)
-              processing(state.copy(passengers = state.passengers + passenger))
+              processTurn(state.copy(passengers = state.passengers + passenger))
           }
-        case _ => Behaviors.same
       }
     }
+    def processTurn(state: ElevatorSystemState)
+      (implicit props: ElevatorSystemProps): Behavior[ElevatorSystemMsg] = Behaviors.setup { ctx =>
+      println(state)
+      Behaviors.receiveMessage {
+        case _ =>
+          Behaviors.same
+      }
+    }
+    def afterTurn(): Behavior[ElevatorSystemMsg] = ???
+
+    beforeTurn()
+  }
 }
 
 object Building {
@@ -206,6 +217,7 @@ object PassengerGenerator {
   final case class GeneratePassenger(time: Int) extends PassengerGeneratorCommand
 
   def apply(props: PassengerGeneratorProps): Behavior[PassengerGeneratorMsg] = Behaviors.receiveMessage {
+    // TODO 毎回生成されてしまうので、はずれのケースを設けてOptionで返すように
     case GeneratePassenger(time) =>
       import RandomUtil._
       props.system ! PassengerGenerated(
@@ -225,7 +237,6 @@ object RandomUtil {
     y ^ (y << 15)
   }
 }
-
 
 trait ElevatorLogic {
 
