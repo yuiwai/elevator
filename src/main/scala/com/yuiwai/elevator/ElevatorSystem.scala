@@ -3,13 +3,14 @@ package com.yuiwai.elevator
 import akka.actor.typed.scaladsl.Behaviors
 import akka.actor.typed.{ActorRef, ActorSystem, Behavior}
 import com.yuiwai.elevator.Building._
-import com.yuiwai.elevator.Elevator.{Direction, Down, ElevatorEvent, ElevatorInitialized, ElevatorMsg, ElevatorProps, Execute, StateKept}
+import com.yuiwai.elevator.Elevator.{apply => _, _}
 import com.yuiwai.elevator.ElevatorSystem.{BuildingCallback, PassengerGeneratorCallback}
 import com.yuiwai.elevator.Passenger.{PassengerEvent, PassengerMsg, PassengerProps}
 import com.yuiwai.elevator.PassengerGenerator.{apply => _, _}
 
 import scala.io.StdIn
 import scala.util.Random
+import scala.util.chaining._
 
 object EntryPoint {
   def main(args: Array[String]): Unit = {
@@ -139,7 +140,7 @@ object Building {
 
 object Elevator {
   final case class ElevatorProps(building: ActorRef[ElevatorCallback])
-  final case class ElevatorState(currentFloor: Int, targetFloor: Option[Int])
+  final case class ElevatorState(currentFloor: Int, targetFloors: List[Int])
 
   sealed trait ElevatorStateType
   case object Stopping extends ElevatorStateType
@@ -162,17 +163,41 @@ object Elevator {
   final case class Entered(passenger: ActorRef[PassengerMsg]) extends ElevatorEvent
   final case class StateKept(stateType: ElevatorStateType) extends ElevatorEvent
   final case class StateChanged(stateType: ElevatorStateType) extends ElevatorEvent
+  final case class StopAdded(floors: List[Int]) extends ElevatorEvent
 
   sealed trait ElevatorError extends ElevatorEvent
   final case class EnterError(passenger: ActorRef[PassengerMsg]) extends ElevatorError
 
   sealed trait ElevatorMsg
   final case class Enter(passenger: ActorRef[PassengerMsg]) extends ElevatorMsg
+  final case class Left(passenger: ActorRef[PassengerMsg]) extends ElevatorMsg
+  final case class AddStop(floor: Int) extends ElevatorMsg
   case object Execute extends ElevatorMsg
+
+
+  private def addStopImpl(current: Int, add: Int, before: List[Int], after: List[Int]): List[Int] = after match {
+    case Nil => before :+ add
+    case h :: t =>
+      if (h == add) before ++ after
+      else if (h.max(current) > add && h.min(current) < add) before ++ (add :: after)
+      else addStopImpl(current, add, before :+ h, t)
+  }
+  private def addStop(state: ElevatorState, floor: Int)
+    (implicit props: ElevatorProps): ElevatorState = {
+    (state.targetFloors match {
+      // 行き先が空なら単に追加
+      case Nil => state.copy(targetFloors = floor :: Nil)
+      // 行き先が空でなければ次の行き先と現在位置との間に挿入
+      case l => state.copy(targetFloors = addStopImpl(state.currentFloor, floor, Nil, l))
+    })
+      .tap { s =>
+        props.building ! StopAdded(s.targetFloors).callback
+      }
+  }
 
   def apply(props: ElevatorProps): Behavior[ElevatorMsg] = Behaviors.setup { ctx =>
     props.building ! ElevatorInitialized(ctx.self).callback
-    stopping(ElevatorState(1, None))(props)
+    stopping(ElevatorState(1, Nil))(props)
   }
 
   private[elevator] def stopping(state: ElevatorState)
@@ -180,14 +205,16 @@ object Elevator {
     case Enter(passenger) =>
       props.building ! Entered(passenger).callback
       Behaviors.same
+    case AddStop(floor) =>
+      stopping(addStop(state, floor))
     case Execute =>
-      state.targetFloor match {
-        case Some(_) =>
-          props.building ! StateChanged(Moving).callback
-          moving(state)
-        case None =>
+      state.targetFloors match {
+        case Nil =>
           props.building ! StateKept(Stopping).callback
           Behaviors.same
+        case _ =>
+          props.building ! StateChanged(Moving).callback
+          moving(state)
       }
   }
 
@@ -196,7 +223,8 @@ object Elevator {
     case Enter(passenger) =>
       props.building ! EnterError(passenger).callback
       Behaviors.same
-    case _ => Behaviors.same
+    case AddStop(floor) =>
+      moving(addStop(state, floor))
   }
 }
 
