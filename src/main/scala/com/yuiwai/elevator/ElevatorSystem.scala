@@ -56,7 +56,7 @@ object ElevatorSystem {
           case PassengerGenerated(destination, interval) =>
             // TODO 現状は1ターンに最大1人ずつ生成
             val passenger = ctx.spawn(
-              Passenger(PassengerProps(destination, interval, state.currentTime), 1),
+              Passenger(PassengerProps(props.building, interval, state.currentTime), 1, destination),
               s"passenger-${state.currentTime}")
             Direction(1, destination) foreach (direction => props.building ! Join(passenger, 1, direction))
             processTurn(state.copy(passengers = state.passengers + passenger))
@@ -169,11 +169,11 @@ object Elevator {
   final case class EnterError(passenger: ActorRef[PassengerMsg]) extends ElevatorError
 
   sealed trait ElevatorMsg
-  final case class Enter(passenger: ActorRef[PassengerMsg]) extends ElevatorMsg
+  final case class Enter(passenger: ActorRef[PassengerMsg], destination: Int) extends ElevatorMsg
+  final case class Ignore(passenger: ActorRef[PassengerMsg]) extends ElevatorMsg
   final case class Left(passenger: ActorRef[PassengerMsg]) extends ElevatorMsg
   final case class AddStop(floor: Int) extends ElevatorMsg
   case object Execute extends ElevatorMsg
-
 
   private def addStopImpl(current: Int, add: Int, before: List[Int], after: List[Int]): List[Int] = after match {
     case Nil => before :+ add
@@ -202,9 +202,9 @@ object Elevator {
 
   private[elevator] def stopping(state: ElevatorState)
     (implicit props: ElevatorProps): Behavior[ElevatorMsg] = Behaviors.receiveMessage {
-    case Enter(passenger) =>
+    case Enter(passenger, destination) =>
       props.building ! Entered(passenger).callback
-      Behaviors.same
+      stopping(addStop(state, destination))
     case AddStop(floor) =>
       stopping(addStop(state, floor))
     case Execute =>
@@ -220,7 +220,7 @@ object Elevator {
 
   private[elevator] def moving(state: ElevatorState)
     (implicit props: ElevatorProps): Behavior[ElevatorMsg] = Behaviors.receiveMessage {
-    case Enter(passenger) =>
+    case Enter(passenger, _) =>
       props.building ! EnterError(passenger).callback
       Behaviors.same
     case AddStop(floor) =>
@@ -229,26 +229,59 @@ object Elevator {
 }
 
 object Passenger {
-  final case class PassengerProps(destination: Int, interval: Int, createdAt: Int)
-  final case class PassengerState()
+  final case class PassengerProps(building: ActorRef[PassengerCallback], interval: Int, createdAt: Int)
+  final case class PassengerState(destination: Int)
 
-  sealed trait PassengerEvent
+  sealed trait PassengerEvent {
+    def callback: PassengerCallback = PassengerCallback(this)
+  }
   final case class Appeared(floor: Int, destination: Int) extends PassengerEvent
   final case class Left(createdAt: Int) extends PassengerEvent
+  final case class Waiting() extends PassengerEvent
+  final case class Boarding() extends PassengerEvent
+  final case class Staying() extends PassengerEvent
 
   sealed trait PassengerMsg
-  final case class Arrived(floor: Int, direction: Option[Direction]) extends PassengerMsg
-  final case class Stopped(floor: Int) extends PassengerMsg
+  final case class Arrived(elevator: ActorRef[ElevatorMsg], floor: Int, direction: Option[Direction]) extends PassengerMsg
+  final case class Stopped(elevator: ActorRef[ElevatorMsg], floor: Int) extends PassengerMsg
+  final case class TickToPassenger(time: Int) extends PassengerMsg
 
-  def apply(props: PassengerProps, floor: Int): Behavior[PassengerMsg] =
-    Behaviors.setup(_ => waiting(floor))
-  private def waiting(currentFloor: Int): Behavior[PassengerMsg] = Behaviors.receiveMessage {
-    case _ => Behaviors.same
+  def apply(props: PassengerProps, floor: Int, destination: Int): Behavior[PassengerMsg] = {
+    props.building ! Appeared(floor, destination).callback
+    waiting(PassengerState(destination), floor)(props)
   }
-  private def staying(): Behavior[PassengerMsg] = Behaviors.receiveMessage {
-    case _ => Behaviors.same
+  private[elevator] def waiting(state: PassengerState, currentFloor: Int)
+    (implicit props: PassengerProps): Behavior[PassengerMsg] = Behaviors.setup { ctx =>
+    Behaviors.receiveMessage {
+      case Arrived(elevator, floor, direction) =>
+        Direction(currentFloor, state.destination) match {
+          // 最初から目的階にいる場合、stayさせない
+          case None =>
+            props.building ! Left(props.createdAt).callback
+            Behaviors.stopped
+          case Some(d) =>
+            if (currentFloor == floor && direction.forall(_ == d)) {
+              elevator ! Enter(ctx.self, state.destination)
+              boarding()
+            } else {
+              elevator ! Ignore(ctx.self)
+              Behaviors.same
+            }
+        }
+    }
   }
-  private def boarding(): Behavior[PassengerMsg] = Behaviors.receiveMessage {
+  private[elevator] def staying(state: PassengerState, stayingFrom: Int)
+    (implicit props: PassengerProps): Behavior[PassengerMsg] = Behaviors.receiveMessage {
+    case TickToPassenger(time) =>
+      if (stayingFrom + props.interval >= time) {
+        props.building ! Staying().callback
+        Behaviors.same
+      } else {
+        props.building ! Waiting().callback
+        waiting(PassengerState(1), state.destination)
+      }
+  }
+  private[elevator] def boarding(): Behavior[PassengerMsg] = Behaviors.receiveMessage {
     case _ => Behaviors.same
   }
 }
