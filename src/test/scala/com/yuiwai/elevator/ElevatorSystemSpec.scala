@@ -26,12 +26,21 @@ class BuildingSpec extends WordSpec with BeforeAndAfterAll with Matchers {
     "乗客を参加させることが出来る" in {
       val system = testKit.createTestProbe[BuildingCallback]()
       val passenger = testKit.createTestProbe[PassengerMsg]()
-      val building = testKit.spawn(Building.progressing(BuildingState(Set.empty))(BuildingProps(BuildingSetting(10, 2), system.ref, DefaultLogic)))
+      val building =
+        testKit.spawn(
+          Building.progressing(BuildingState(Map.empty, Set.empty))(BuildingProps(BuildingSetting(10, 2),
+            system.ref, DefaultLogic)))
       building ! Join(passenger.ref, 1, Up)
     }
-    "時間経過とによってエレベータが移動する" in {
+    "時間経過によってエレベータが移動する" in {
       // TODO test
     }
+  }
+}
+
+class FloorSpec extends WordSpec with Matchers {
+  "フロアは" should {
+
   }
 }
 
